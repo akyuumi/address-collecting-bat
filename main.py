@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import time
+import re
 from datetime import datetime
 from typing import List, Dict, Set
 from dotenv import load_dotenv
@@ -25,11 +27,26 @@ Base = declarative_base()
 engine = create_engine('sqlite:///db/channels.db')
 Session = sessionmaker(bind=engine)
 
+def extract_email(description: str) -> str:
+    """説明文からメールアドレスを抽出"""
+    if not description:
+        return "取得失敗"
+    
+    # メールアドレスのパターン
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    match = re.search(email_pattern, description)
+    
+    if match:
+        return match.group(0)
+    return "取得失敗"
+
 class Channel(Base):
     __tablename__ = 'channels'
     
     channel_id = Column(String, primary_key=True)
     title = Column(String)
+    description = Column(String)
+    email = Column(String)
     subscriber_count = Column(Integer)
     view_count = Column(Integer)
     video_count = Column(Integer)
@@ -56,24 +73,44 @@ class YouTubeChannelCollector:
     def get_popular_videos(self, category_id: str) -> List[str]:
         """人気動画からチャンネルIDを取得"""
         try:
-            request = self.youtube.videos().list(
-                part='snippet',
-                chart='mostPopular',
-                regionCode='JP',
-                videoCategoryId=category_id,
-                maxResults=50
-            )
-            response = request.execute()
-            
             channel_ids = set()
-            for item in response.get('items', []):
-                channel_id = item['snippet']['channelId']
-                if channel_id not in self.existing_channels:
-                    channel_ids.add(channel_id)
+            next_page_token = None
+            daily_limit = 10000  # YouTube Data APIの1日のクォータ制限
+            total_quota = 0
             
+            while True:
+                request = self.youtube.videos().list(
+                    part='snippet',
+                    chart='mostPopular',
+                    regionCode='JP',
+                    videoCategoryId=category_id,
+                    maxResults=50,
+                    pageToken=next_page_token
+                )
+                response = request.execute()
+                
+                # クォータ消費量の計算（videos.listは1リクエストあたり1クォータ）
+                total_quota += 1
+                
+                for item in response.get('items', []):
+                    channel_id = item['snippet']['channelId']
+                    if channel_id not in self.existing_channels:
+                        channel_ids.add(channel_id)
+                
+                # 次のページのトークンを取得
+                next_page_token = response.get('nextPageToken')
+                
+                # 次のページがない場合、またはクォータ制限に達した場合は終了
+                if not next_page_token or total_quota >= daily_limit:
+                    break
+                
+                # API制限を考慮して少し待機
+                time.sleep(1)
+            
+            logger.info(f"カテゴリID[{category_id}]で{len(channel_ids)}件のチャンネルを取得しました。")
             return list(channel_ids)
         except Exception as e:
-            logger.error(f"Error fetching popular videos for category {category_id}: {str(e)}")
+            logger.error(f"動画の取得に失敗しました。カテゴリID[{category_id}]: {str(e)}")
             return []
     
     def get_channel_details(self, channel_ids: List[str]) -> List[Dict]:
@@ -81,30 +118,41 @@ class YouTubeChannelCollector:
         if not channel_ids:
             return []
         
-        try:
-            request = self.youtube.channels().list(
-                part='snippet,statistics',
-                id=','.join(channel_ids),
-                maxResults=50
-            )
-            response = request.execute()
-            
-            channels = []
-            for item in response.get('items', []):
-                channel = {
-                    'channel_id': item['id'],
-                    'title': item['snippet']['title'],
-                    'subscriber_count': int(item['statistics'].get('subscriberCount', 0)),
-                    'view_count': int(item['statistics'].get('viewCount', 0)),
-                    'video_count': int(item['statistics'].get('videoCount', 0)),
-                    'fetched_at': datetime.now()
-                }
-                channels.append(channel)
-            
-            return channels
-        except Exception as e:
-            logger.error(f"Error fetching channel details: {str(e)}")
-            return []
+        channels = []
+        # チャンネルIDを50個ずつのバッチに分割
+        batch_size = 50
+        for i in range(0, len(channel_ids), batch_size):
+            batch = channel_ids[i:i + batch_size]
+            try:
+                request = self.youtube.channels().list(
+                    part='snippet,statistics',
+                    id=','.join(batch),
+                    maxResults=batch_size
+                )
+                response = request.execute()
+                
+                for item in response.get('items', []):
+                    description = item['snippet'].get('description', '')
+                    channel = {
+                        'channel_id': item['id'],
+                        'title': item['snippet']['title'],
+                        'description': description,
+                        'email': extract_email(description),
+                        'subscriber_count': int(item['statistics'].get('subscriberCount', 0)),
+                        'view_count': int(item['statistics'].get('viewCount', 0)),
+                        'video_count': int(item['statistics'].get('videoCount', 0)),
+                        'fetched_at': datetime.now()
+                    }
+                    channels.append(channel)
+                
+                # API制限を考慮して少し待機
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"チャンネル詳細の取得に失敗しました。バッチ {i//batch_size + 1}: {str(e)}")
+                continue
+        
+        return channels
     
     def save_channels(self, channels: List[Dict]):
         """チャンネル情報をDBに保存"""
@@ -115,9 +163,11 @@ class YouTubeChannelCollector:
     
     def run(self):
         """メイン処理の実行"""
+        # カテゴリIDの読み込み
         categories = self._load_category_ids()
         total_new_channels = 0
         
+        # カテゴリごとに処理
         for category in categories:
             logger.info(f"Processing category: {category['name']} (ID: {category['id']})")
             
@@ -126,7 +176,7 @@ class YouTubeChannelCollector:
             
             if channel_ids:
                 # チャンネル詳細を取得
-                channels = self.get_channel_details(channel_ids)
+                channels: List[Dict] = self.get_channel_details(channel_ids)
                 
                 # DBに保存
                 self.save_channels(channels)
@@ -136,11 +186,14 @@ class YouTubeChannelCollector:
                 logger.info(f"Fetched {new_channels_count} new channels in category {category['name']}")
             
             # API制限を考慮して少し待機
-            import time
             time.sleep(1)
         
-        logger.info(f"Completed! Total new channels collected: {total_new_channels}")
+        logger.info(f"処理が完了しました。合計取得チャンネル数: {total_new_channels}")
 
 if __name__ == '__main__':
+
+    if not API_KEY:
+        raise "APIキーが設定されていません。"
+
     collector = YouTubeChannelCollector()
     collector.run() 
