@@ -21,20 +21,4 @@ pip install -r requirements.txt
 # メインスクリプトを実行
 python main.py
 
-# cronの設定
-CRON_JOB="30 18 * * * $SCRIPT_DIR/execute.bash >> $SCRIPT_DIR/cron.log 2>&1"
-
-# 既存のcronジョブを確認
-EXISTING_CRON=$(crontab -l 2>/dev/null)
-
-# 既に同じジョブが設定されていないか確認
-if ! echo "$EXISTING_CRON" | grep -q "$SCRIPT_DIR/execute.bash"; then
-    # 新しいcronジョブを追加
-    (echo "$EXISTING_CRON"; echo "$CRON_JOB") | crontab -
-    echo "Cron job has been set to run daily at 18:30"
-else
-    echo "Cron job already exists"
-fi
-
-
 
