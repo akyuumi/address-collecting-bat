@@ -10,6 +10,9 @@ from googleapiclient.discovery import build
 from sqlalchemy import create_engine, Column, String, Integer, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+import pandas as pd
+from google.cloud import storage
+from google.oauth2 import service_account
 
 # ロギングの設定
 logging.basicConfig(
@@ -21,6 +24,8 @@ logger = logging.getLogger(__name__)
 # 環境変数の読み込み
 load_dotenv()
 API_KEY = os.getenv('YOUTUBE_API_KEY')
+GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
+GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')
 
 # SQLAlchemyの設定
 Base = declarative_base()
@@ -60,6 +65,25 @@ class YouTubeChannelCollector:
         self.youtube = build('youtube', 'v3', developerKey=API_KEY)
         self.session = Session()
         self.existing_channels = self._load_existing_channels()
+        
+        # GCSクライアントの初期化
+        if GCS_CREDENTIALS_JSON:
+            try:
+                credentials_info = json.loads(GCS_CREDENTIALS_JSON)
+                credentials = service_account.Credentials.from_service_account_info(
+                    credentials_info
+                )
+                self.storage_client = storage.Client(credentials=credentials)
+                logger.info("GCS認証情報を環境変数から読み込みました")
+            except json.JSONDecodeError as e:
+                logger.error(f"GCS認証情報のJSON形式が不正です: {str(e)}")
+                self.storage_client = None
+            except Exception as e:
+                logger.error(f"GCS認証情報の読み込みに失敗しました: {str(e)}")
+                self.storage_client = None
+        else:
+            self.storage_client = None
+            logger.warning("GCS認証情報が設定されていません。GCSアップロード機能は使用できません。")
         
     def _load_existing_channels(self) -> Set[str]:
         """既存のチャンネルIDを取得"""
@@ -161,6 +185,51 @@ class YouTubeChannelCollector:
             self.session.merge(channel)
         self.session.commit()
     
+    def export_to_csv_and_upload(self):
+        """チャンネルデータをCSVにエクスポートし、GCSにアップロード"""
+        try:
+            # チャンネルデータを取得
+            channels = self.session.query(Channel).all()
+            
+            # DataFrameに変換
+            df = pd.DataFrame([{
+                'channel_id': c.channel_id,
+                'title': c.title,
+                'description': c.description,
+                'email': c.email,
+                'subscriber_count': c.subscriber_count,
+                'view_count': c.view_count,
+                'video_count': c.video_count,
+                'fetched_at': c.fetched_at
+            } for c in channels])
+            
+            # CSVファイル名を生成（現在の日時を含める）
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            csv_filename = f'channels_{timestamp}.csv'
+            
+            # CSVファイルを保存
+            df.to_csv(csv_filename, index=False, encoding='utf-8')
+            logger.info(f"CSVファイルを作成しました: {csv_filename}")
+            
+            # GCSにアップロード
+            if self.storage_client and GCS_BUCKET_NAME:
+                bucket = self.storage_client.bucket(GCS_BUCKET_NAME)
+                blob = bucket.blob(csv_filename)
+                blob.upload_from_filename(csv_filename)
+                logger.info(f"CSVファイルをGCSにアップロードしました: gs://{GCS_BUCKET_NAME}/{csv_filename}")
+                
+                # ローカルのCSVファイルを削除
+                os.remove(csv_filename)
+                logger.info(f"ローカルのCSVファイルを削除しました: {csv_filename}")
+            else:
+                logger.warning("GCS認証情報またはバケット名が設定されていないため、GCSへのアップロードをスキップしました")
+                
+        except Exception as e:
+            logger.error(f"CSVエクスポートまたはGCSアップロード中にエラーが発生しました: {str(e)}")
+            # エラーが発生した場合でも、ローカルのCSVファイルは残しておく
+            if os.path.exists(csv_filename):
+                logger.info(f"エラーが発生したため、CSVファイルを保持します: {csv_filename}")
+    
     def run(self):
         """メイン処理の実行"""
         # カテゴリIDの読み込み
@@ -189,11 +258,17 @@ class YouTubeChannelCollector:
             time.sleep(1)
         
         logger.info(f"処理が完了しました。合計取得チャンネル数: {total_new_channels}")
+        
+        # CSVエクスポートとGCSアップロードを実行
+        logger.info(f"CSV出力+GCSアップロード処理を開始します。")
+        self.export_to_csv_and_upload()
+        logger.info(f"CSV出力+GCSアップロード処理が完了しました。")
 
 if __name__ == '__main__':
-
     if not API_KEY:
-        raise "APIキーが設定されていません。"
+        raise ValueError("YouTube APIキーが設定されていません。")
+    if not GCS_CREDENTIALS_JSON:
+        raise ValueError("GCS認証情報が設定されていません。")
 
     collector = YouTubeChannelCollector()
     collector.run() 

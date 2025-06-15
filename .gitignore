@@ -41,3 +41,9 @@ ENV/
 
 # Logs
 *.log 
+
+# 仮想環境
+.venv
+
+# CSV
+*csv
