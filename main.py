@@ -238,7 +238,7 @@ class YouTubeChannelCollector:
         
         # カテゴリごとに処理
         for category in categories:
-            logger.info(f"Processing category: {category['name']} (ID: {category['id']})")
+            logger.info(f"処理中 カテゴリ: {category['name']} (ID: {category['id']})")
             
             # 人気動画からチャンネルIDを取得
             channel_ids = self.get_popular_videos(category['id'])
