@@ -12,10 +12,18 @@ import pandas as pd
 from google.cloud import storage
 from google.oauth2 import service_account
 
+# ログファイル名をバッチごとに生成
+LOG_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
+LOG_FILENAME = f'batch_{LOG_TIMESTAMP}.log'
+
 # ロギングの設定
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILENAME, encoding='utf-8')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -235,11 +243,16 @@ class YouTubeChannelCollector:
         logger.info(f"{len(new_channels)}件の新規チャンネルをデータに追加しました。")
     
     def export_to_csv_and_upload(self):
-        """チャンネルデータをCSVにエクスポートし、GCSにアップロード"""
+        """チャンネルデータをCSVにエクスポートし、GCSにアップロード（GCS上は常に1ファイルのみ）"""
         try:
+            # fetched_at列を文字列化
+            if 'fetched_at' in self.channels_df.columns:
+                self.channels_df['fetched_at'] = self.channels_df['fetched_at'].astype(str)
+
             # CSVファイル名を生成（現在の日時を含める）
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             csv_filename = f'channels_{timestamp}.csv'
+            csv_gcs_path = f'csv/{csv_filename}'
             
             # CSVファイルを保存
             self.channels_df.to_csv(csv_filename, index=False, encoding='utf-8')
@@ -248,10 +261,16 @@ class YouTubeChannelCollector:
             # GCSにアップロード
             if self.storage_client and GCS_BUCKET_NAME:
                 bucket = self.storage_client.bucket(GCS_BUCKET_NAME)
-                blob = bucket.blob(csv_filename)
+                # 既存のcsv/配下のCSVを全削除
+                blobs = list(bucket.list_blobs(prefix='csv/'))
+                for blob in blobs:
+                    if blob.name.endswith('.csv'):
+                        blob.delete()
+                        logger.info(f"GCS上の既存CSVを削除: {blob.name}")
+                # 新しいCSVをアップロード
+                blob = bucket.blob(csv_gcs_path)
                 blob.upload_from_filename(csv_filename)
-                logger.info(f"CSVファイルをGCSにアップロードしました: gs://{GCS_BUCKET_NAME}/{csv_filename}")
-                
+                logger.info(f"CSVファイルをGCSにアップロードしました: gs://{GCS_BUCKET_NAME}/{csv_gcs_path}")
                 # ローカルのCSVファイルを削除
                 os.remove(csv_filename)
                 logger.info(f"ローカルのCSVファイルを削除しました: {csv_filename}")
@@ -264,23 +283,41 @@ class YouTubeChannelCollector:
             if os.path.exists(csv_filename):
                 logger.info(f"エラーが発生したため、CSVファイルを保持します: {csv_filename}")
     
+    def upload_log_to_gcs(self):
+        """ローカルのログファイルをGCSのlogs/にアップロード"""
+        if not self.storage_client or not GCS_BUCKET_NAME:
+            logger.warning("GCS認証情報またはバケット名が設定されていないため、ログのGCSアップロードをスキップします。")
+            return
+        try:
+            bucket = self.storage_client.bucket(GCS_BUCKET_NAME)
+            log_gcs_path = f'logs/{LOG_FILENAME}'
+            blob = bucket.blob(log_gcs_path)
+            blob.upload_from_filename(LOG_FILENAME)
+            logger.info(f"ログファイルをGCSにアップロードしました: gs://{GCS_BUCKET_NAME}/{log_gcs_path}")
+            # ローカルのログファイルを削除（必要なら）
+            os.remove(LOG_FILENAME)
+            logger.info(f"ローカルのログファイルを削除しました: {LOG_FILENAME}")
+        except Exception as e:
+            logger.error(f"ログファイルのGCSアップロードに失敗しました: {str(e)}")
+            if os.path.exists(LOG_FILENAME):
+                logger.info(f"エラーが発生したため、ログファイルを保持します: {LOG_FILENAME}")
+    
     def send_slack_notification(self, new_channels: List[Dict]):
         """Slackに新規チャンネル情報を通知"""
-        
         if not new_channels:
             logger.info("新規チャンネルがないため、Slack通知をスキップします。")
             return
-        
         try:
+            # メールアドレスが取得できた件数
+            email_count = sum(1 for c in new_channels if c.get('email') and c['email'] != '取得失敗')
             message = f"🎉 YouTubeチャンネル収集バッチ実行完了！\n\n"
             message += f"📊 **実行結果**\n"
             message += f"• 新規取得チャンネル数: {len(new_channels)}件\n"
+            message += f"• メールアドレス取得件数: {email_count}件\n"
             message += f"• 実行時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             message += f"• 総チャンネル数: {len(self.channels_df)}件\n\n"
-            
             if new_channels:
                 message += f"📋 **新規チャンネル一覧**\n"
-                
                 for i, channel in enumerate(new_channels[:10], 1):  # 最大10件まで表示
                     message += f"{i}. **{channel['title']}**\n"
                     message += f"   • チャンネルID: `{channel['channel_id']}`\n"
@@ -288,20 +325,17 @@ class YouTubeChannelCollector:
                     message += f"   • 登録者数: {channel['subscriber_count']:,}\n"
                     message += f"   • 総再生回数: {channel['view_count']:,}\n"
                     message += f"   • 動画数: {channel['video_count']:,}\n\n"
-                
                 if len(new_channels) > 10:
                     message += f"... 他 {len(new_channels) - 10}件のチャンネルも取得されました。\n\n"
-            
             message += f"📁 CSVファイルはGCSにアップロードされました。"
-            
             payload = {"text": message}
             response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
-            
             if response.status_code == 200:
                 logger.info("Slack通知を送信しました。")
             else:
                 logger.error(f"Slack通知の送信に失敗しました。ステータスコード: {response.status_code}")
-                
+            # ログにも出力
+            logger.info(f"メールアドレス取得件数: {email_count}件 (新規チャンネル数: {len(new_channels)})")
         except Exception as e:
             logger.error(f"Slack通知の送信中にエラーが発生しました: {str(e)}")
     
@@ -347,6 +381,9 @@ class YouTubeChannelCollector:
         logger.info(f"Slack通知処理を開始します。新規チャンネル数: {len(all_new_channels)}")
         self.send_slack_notification(all_new_channels)
         
+        # ログファイルのGCSアップロード
+        logger.info(f"ログファイルのGCSアップロード処理を開始します。")
+        self.upload_log_to_gcs()
         logger.info(f"バッチ処理が完了しました。新規チャンネル: {len(all_new_channels)}件, 総チャンネル数: {len(self.channels_df)}件")
 
 if __name__ == '__main__':
