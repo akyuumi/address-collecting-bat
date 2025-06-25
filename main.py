@@ -304,12 +304,31 @@ class YouTubeChannelCollector:
     
     def send_slack_notification(self, new_channels: List[Dict]):
         """Slackに新規チャンネル情報を通知"""
+        # メールアドレスが取得できた件数
+        email_count = sum(1 for c in new_channels if c.get('email') and c['email'] != '取得失敗')
         if not new_channels:
-            logger.info("新規チャンネルがないため、Slack通知をスキップします。")
+            message = (
+                "🎉 YouTubeチャンネル収集バッチ実行完了！\n\n"
+                "📊 **実行結果**\n"
+                "• 新規取得チャンネル数: 0件\n"
+                f"• メールアドレス取得件数: 0件\n"
+                f"• 実行時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"• 総チャンネル数: {len(self.channels_df)}件\n\n"
+                "新たに取得できたチャンネルはありませんでした。\n"
+                "📁 CSVファイルはGCSにアップロードされました。"
+            )
+            payload = {"text": message}
+            try:
+                response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+                if response.status_code == 200:
+                    logger.info("Slack通知を送信しました（0件）。")
+                else:
+                    logger.error(f"Slack通知の送信に失敗しました。ステータスコード: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Slack通知の送信中にエラーが発生しました: {str(e)}")
+            logger.info(f"メールアドレス取得件数: 0件 (新規チャンネル数: 0)")
             return
         try:
-            # メールアドレスが取得できた件数
-            email_count = sum(1 for c in new_channels if c.get('email') and c['email'] != '取得失敗')
             message = f"🎉 YouTubeチャンネル収集バッチ実行完了！\n\n"
             message += f"📊 **実行結果**\n"
             message += f"• 新規取得チャンネル数: {len(new_channels)}件\n"
