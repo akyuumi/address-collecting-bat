@@ -25,6 +25,7 @@ API_KEY = os.getenv('YOUTUBE_API_KEY')
 GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
 GCS_CREDENTIALS_JSON = os.getenv('GCS_CREDENTIALS_JSON')
 SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL')
+MIN_SUBSCRIBER_COUNT = int(os.getenv('MIN_SUBSCRIBER_COUNT', '100000'))  # 10万未満除外
 
 def extract_email(description: str) -> str:
     """説明文からメールアドレスを抽出"""
@@ -194,12 +195,15 @@ class YouTubeChannelCollector:
                 
                 for item in response.get('items', []):
                     description = item['snippet'].get('description', '')
+                    subscriber_count = int(item['statistics'].get('subscriberCount', 0))
+                    if subscriber_count < MIN_SUBSCRIBER_COUNT:
+                        continue  # 10万未満は除外
                     channel = {
                         'channel_id': item['id'],
                         'title': item['snippet']['title'],
                         'description': description,
                         'email': extract_email(description),
-                        'subscriber_count': int(item['statistics'].get('subscriberCount', 0)),
+                        'subscriber_count': subscriber_count,
                         'view_count': int(item['statistics'].get('viewCount', 0)),
                         'video_count': int(item['statistics'].get('videoCount', 0)),
                         'fetched_at': datetime.now()
@@ -262,9 +266,6 @@ class YouTubeChannelCollector:
     
     def send_slack_notification(self, new_channels: List[Dict]):
         """Slackに新規チャンネル情報を通知"""
-        if not SLACK_WEBHOOK_URL:
-            logger.warning("Slack Webhook URLが設定されていません。通知をスキップします。")
-            return
         
         if not new_channels:
             logger.info("新規チャンネルがないため、Slack通知をスキップします。")
@@ -283,7 +284,7 @@ class YouTubeChannelCollector:
                 for i, channel in enumerate(new_channels[:10], 1):  # 最大10件まで表示
                     message += f"{i}. **{channel['title']}**\n"
                     message += f"   • チャンネルID: `{channel['channel_id']}`\n"
-                    message += f"   • メール: {channel['email']}\n"
+                    message += f"   • メールアドレス: {channel['email']}\n"
                     message += f"   • 登録者数: {channel['subscriber_count']:,}\n"
                     message += f"   • 総再生回数: {channel['view_count']:,}\n"
                     message += f"   • 動画数: {channel['video_count']:,}\n\n"
@@ -353,6 +354,8 @@ if __name__ == '__main__':
         raise ValueError("YouTube APIキーが設定されていません。")
     if not GCS_CREDENTIALS_JSON:
         raise ValueError("GCS認証情報が設定されていません。")
+    if not SLACK_WEBHOOK_URL:
+        raise ValueError("SLACK_WEBHOOK_URLが設定されていません。")
 
     collector = YouTubeChannelCollector()
     collector.run() 
