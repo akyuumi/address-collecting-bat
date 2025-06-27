@@ -242,46 +242,48 @@ class YouTubeChannelCollector:
         
         logger.info(f"{len(new_channels)}件の新規チャンネルをデータに追加しました。")
     
-    def export_to_csv_and_upload(self):
-        """チャンネルデータをCSVにエクスポートし、GCSにアップロード（GCS上は常に1ファイルのみ）"""
+    def export_to_csv_and_upload(self, new_channels: List[Dict]):
+        """新規取得分のみをGCSのchannels.csvに追記アップロード"""
         try:
-            # fetched_at列を文字列化
-            if 'fetched_at' in self.channels_df.columns:
-                self.channels_df['fetched_at'] = self.channels_df['fetched_at'].astype(str)
+            if not new_channels:
+                logger.info("新規取得分がないため、CSV追記アップロードをスキップします。")
+                return
 
-            # CSVファイル名を生成（現在の日時を含める）
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            csv_filename = f'channels_{timestamp}.csv'
-            csv_gcs_path = f'csv/{csv_filename}'
-            
-            # CSVファイルを保存
-            self.channels_df.to_csv(csv_filename, index=False, encoding='utf-8')
-            logger.info(f"CSVファイルを作成しました: {csv_filename}")
-            
-            # GCSにアップロード
+            # 新規分のDataFrame
+            new_df = pd.DataFrame(new_channels)
+            csv_gcs_path = 'csv/channels.csv'
+            local_csv = 'channels.csv'
+
             if self.storage_client and GCS_BUCKET_NAME:
                 bucket = self.storage_client.bucket(GCS_BUCKET_NAME)
-                # 既存のcsv/配下のCSVを全削除
-                blobs = list(bucket.list_blobs(prefix='csv/'))
-                for blob in blobs:
-                    if blob.name.endswith('.csv'):
-                        blob.delete()
-                        logger.info(f"GCS上の既存CSVを削除: {blob.name}")
-                # 新しいCSVをアップロード
                 blob = bucket.blob(csv_gcs_path)
-                blob.upload_from_filename(csv_filename)
+                if blob.exists():
+                    blob.download_to_filename(local_csv)
+                    logger.info(f"GCSから既存CSVをダウンロード: {csv_gcs_path}")
+                    existing_df = pd.read_csv(local_csv, encoding='utf-8')
+                    combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                else:
+                    logger.info("GCSに既存CSVがないため、新規作成します。")
+                    combined_df = new_df
+
+                # fetched_atを文字列化
+                if 'fetched_at' in combined_df.columns:
+                    combined_df['fetched_at'] = combined_df['fetched_at'].astype(str)
+
+                # 上書き保存
+                combined_df.to_csv(local_csv, index=False, encoding='utf-8')
+                # GCSにアップロード
+                blob.upload_from_filename(local_csv)
                 logger.info(f"CSVファイルをGCSにアップロードしました: gs://{GCS_BUCKET_NAME}/{csv_gcs_path}")
                 # ローカルのCSVファイルを削除
-                os.remove(csv_filename)
-                logger.info(f"ローカルのCSVファイルを削除しました: {csv_filename}")
+                os.remove(local_csv)
+                logger.info(f"ローカルのCSVファイルを削除しました: {local_csv}")
             else:
                 logger.warning("GCS認証情報またはバケット名が設定されていないため、GCSへのアップロードをスキップしました")
-                
         except Exception as e:
             logger.error(f"CSVエクスポートまたはGCSアップロード中にエラーが発生しました: {str(e)}")
-            # エラーが発生した場合でも、ローカルのCSVファイルは残しておく
-            if os.path.exists(csv_filename):
-                logger.info(f"エラーが発生したため、CSVファイルを保持します: {csv_filename}")
+            if os.path.exists(local_csv):
+                logger.info(f"エラーが発生したため、CSVファイルを保持します: {local_csv}")
     
     def upload_log_to_gcs(self):
         """ローカルのログファイルをGCSのlogs/にアップロード"""
@@ -391,9 +393,9 @@ class YouTubeChannelCollector:
         
         logger.info(f"処理が完了しました。合計取得チャンネル数: {total_new_channels}")
         
-        # CSVエクスポートとGCSアップロードを実行
+        # CSVエクスポートとGCSアップロードを実行（差分のみ渡す）
         logger.info(f"CSV出力+GCSアップロード処理を開始します。")
-        self.export_to_csv_and_upload()
+        self.export_to_csv_and_upload(all_new_channels)
         logger.info(f"CSV出力+GCSアップロード処理が完了しました。")
         
         # Slack通知
